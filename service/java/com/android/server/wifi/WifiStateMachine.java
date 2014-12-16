@@ -4604,7 +4604,9 @@ public class WifiStateMachine extends StateMachine {
 
         @Override
         protected void needNetworkFor(NetworkRequest networkRequest, int score) {
-            ++mConnectionRequests;
+            if (score < 60) {
+                ++mConnectionRequests;
+            }
             if (!networkRequest.networkCapabilities.hasCapability(
                     NetworkCapabilities.NET_CAPABILITY_TRUSTED)) {
                 if (++mUntrustedReqCount == 1) {
@@ -4637,7 +4639,7 @@ public class WifiStateMachine extends StateMachine {
             if (mCm != null) {
                 mNetworkFactory = new WifiNetworkFactory(getHandler().getLooper(), mContext,
                         NETWORKTYPE, mNetworkCapabilitiesFilter);
-                mNetworkFactory.setScoreFilter(60);
+                mNetworkFactory.setScoreFilter(Integer.MAX_VALUE);
                 mNetworkFactory.register();
             }
         }
