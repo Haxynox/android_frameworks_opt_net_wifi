@@ -69,6 +69,7 @@ import android.util.Slog;
 
 import com.android.internal.R;
 import com.android.internal.app.IBatteryStats;
+import com.android.internal.telephony.IccCardConstants;
 import com.android.internal.telephony.TelephonyIntents;
 import com.android.internal.util.AsyncChannel;
 import com.android.server.am.BatteryStatsService;
@@ -358,9 +359,26 @@ public final class WifiServiceImpl extends IWifiManager.Stub {
                         if (mSettingsStore.handleAirplaneModeToggled()) {
                             mWifiController.sendMessage(CMD_AIRPLANE_TOGGLED);
                         }
+                        if (mSettingsStore.isAirplaneModeOn()) {
+                            Log.d(TAG, "resetting country code because Airplane mode is ON");
+                            mWifiStateMachine.resetCountryCode();
+                        }
                     }
                 },
                 new IntentFilter(Intent.ACTION_AIRPLANE_MODE_CHANGED));
+
+        mContext.registerReceiver(
+                new BroadcastReceiver() {
+                    @Override
+                    public void onReceive(Context context, Intent intent) {
+                        String state = intent.getStringExtra(IccCardConstants.INTENT_KEY_ICC_STATE);
+                        if (state.equals(IccCardConstants.INTENT_VALUE_ICC_ABSENT)) {
+                            Log.d(TAG, "resetting country code because SIM is removed");
+                            mWifiStateMachine.resetCountryCode();
+                        }
+                    }
+                },
+                new IntentFilter(TelephonyIntents.ACTION_SIM_STATE_CHANGED));
 
         // Adding optimizations of only receiving broadcasts when wifi is enabled
         // can result in race conditions when apps toggle wifi in the background
@@ -970,7 +988,7 @@ public final class WifiServiceImpl extends IWifiManager.Stub {
         long ident = Binder.clearCallingIdentity();
         try {
             if (!canReadPeerMacAddresses && !isActiveNetworkScorer
-                    && !isLocationEnabled()) {
+                    && !isLocationEnabled(callingPackage)) {
                 return new ArrayList<ScanResult>();
             }
             if (!canReadPeerMacAddresses && !isActiveNetworkScorer
@@ -990,9 +1008,12 @@ public final class WifiServiceImpl extends IWifiManager.Stub {
         }
     }
 
-    private boolean isLocationEnabled() {
-        return Settings.Secure.getInt(mContext.getContentResolver(), Settings.Secure.LOCATION_MODE,
-                Settings.Secure.LOCATION_MODE_OFF) != Settings.Secure.LOCATION_MODE_OFF;
+    private boolean isLocationEnabled(String callingPackage) {
+        boolean legacyForegroundApp = !isMApp(mContext, callingPackage)
+                && isForegroundApp(callingPackage);
+        return legacyForegroundApp || Settings.Secure.getInt(mContext.getContentResolver(),
+                Settings.Secure.LOCATION_MODE, Settings.Secure.LOCATION_MODE_OFF)
+                != Settings.Secure.LOCATION_MODE_OFF;
     }
 
     /**
@@ -1101,7 +1122,7 @@ public final class WifiServiceImpl extends IWifiManager.Stub {
      */
     public String getCountryCode() {
         enforceConnectivityInternalPermission();
-        String country = mWifiStateMachine.getCountryCode();
+        String country = mWifiStateMachine.getCurrentCountryCode();
         return country;
     }
     /**
@@ -1913,7 +1934,7 @@ public final class WifiServiceImpl extends IWifiManager.Stub {
         return mWifiStateMachine.getEnableAutoJoinWhenAssociated();
     }
     public void setHalBasedAutojoinOffload(int enabled) {
-        enforceChangePermission();
+        enforceConnectivityInternalPermission();
         mWifiStateMachine.setHalBasedAutojoinOffload(enabled);
     }
 
@@ -2046,29 +2067,18 @@ public final class WifiServiceImpl extends IWifiManager.Stub {
     private boolean checkCallerCanAccessScanResults(String callingPackage, int uid) {
         if (ActivityManager.checkUidPermission(Manifest.permission.ACCESS_FINE_LOCATION, uid)
                 == PackageManager.PERMISSION_GRANTED
-                && isAppOppAllowed(AppOpsManager.OP_FINE_LOCATION, callingPackage, uid)) {
+                && checkAppOppAllowed(AppOpsManager.OP_FINE_LOCATION, callingPackage, uid)) {
             return true;
         }
 
         if (ActivityManager.checkUidPermission(Manifest.permission.ACCESS_COARSE_LOCATION, uid)
                 == PackageManager.PERMISSION_GRANTED
-                && isAppOppAllowed(AppOpsManager.OP_COARSE_LOCATION, callingPackage, uid)) {
+                && checkAppOppAllowed(AppOpsManager.OP_COARSE_LOCATION, callingPackage, uid)) {
             return true;
         }
-        // Enforce location permission for apps targeting M and later versions
-        boolean enforceLocationPermission = true;
-        try {
-            enforceLocationPermission = mContext.getPackageManager().getApplicationInfo(
-                    callingPackage, 0).targetSdkVersion >= Build.VERSION_CODES.M;
-        } catch (PackageManager.NameNotFoundException e) {
-            // In case of exception, enforce permission anyway
-        }
-        if (enforceLocationPermission) {
-            throw new SecurityException("Need ACCESS_COARSE_LOCATION or "
-                    + "ACCESS_FINE_LOCATION permission to get scan results");
-        }
+        boolean apiLevel23App = isMApp(mContext, callingPackage);
         // Pre-M apps running in the foreground should continue getting scan results
-        if (isForegroundApp(callingPackage)) {
+        if (!apiLevel23App && isForegroundApp(callingPackage)) {
             return true;
         }
         Log.e(TAG, "Permission denial: Need ACCESS_COARSE_LOCATION or ACCESS_FINE_LOCATION "
@@ -2076,8 +2086,18 @@ public final class WifiServiceImpl extends IWifiManager.Stub {
         return false;
     }
 
-    private boolean isAppOppAllowed(int op, String callingPackage, int uid) {
+    private boolean checkAppOppAllowed(int op, String callingPackage, int uid) {
         return mAppOps.noteOp(op, uid, callingPackage) == AppOpsManager.MODE_ALLOWED;
+    }
+
+    private static boolean isMApp(Context context, String pkgName) {
+        try {
+            return context.getPackageManager().getApplicationInfo(pkgName, 0)
+                    .targetSdkVersion >= Build.VERSION_CODES.M;
+        } catch (PackageManager.NameNotFoundException e) {
+            // In case of exception, assume M app (more strict checking)
+        }
+        return true;
     }
 
     /**
